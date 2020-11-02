@@ -2,16 +2,23 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::string::FromUtf8Error;
-use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum MultipartFormDataError {
     NotFormDataError,
+    MultipartError(multipart_async::server::Error<io::Error>),
     BoundaryNotFoundError,
     IOError(io::Error),
     FromUtf8Error(FromUtf8Error),
-    DataTooLargeError(Arc<str>),
-    DataTypeError(Arc<str>),
+    DataTooLargeError(String),
+    DataTypeError(String),
+}
+
+impl From<multipart_async::server::Error<io::Error>> for MultipartFormDataError {
+    #[inline]
+    fn from(err: multipart_async::server::Error<io::Error>) -> MultipartFormDataError {
+        MultipartFormDataError::MultipartError(err)
+    }
 }
 
 impl From<io::Error> for MultipartFormDataError {
@@ -35,6 +42,7 @@ impl Display for MultipartFormDataError {
             MultipartFormDataError::NotFormDataError => {
                 f.write_str("The content type is not `multipart/form-data`.")
             }
+            MultipartFormDataError::MultipartError(err) => Display::fmt(err, f),
             MultipartFormDataError::BoundaryNotFoundError => {
                 f.write_str(
                     "The boundary cannot be found. Maybe the multipart form data is incorrect.",

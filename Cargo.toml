@@ -17,9 +17,10 @@ repository = "magiclen/rocket-multipart-form-data"
 branch = "master"
 
 [dependencies]
-rocket = "0.4.5"
+rocket = { version = "0.5.0-dev", git = "https://github.com/SergioBenitez/Rocket.git" }
 mime = "0.3.12"
-multipart = { version = "0.17", default-features = false, features = ["server"] }
+multipart-async = { version = "0", git = "https://github.com/abonander/multipart-async.git", default-features = false, features = ["server"] }
+tokio-util = { version = "0.2", features = ["codec"] }
 
 [dev-dependencies]
 rocket-include-static-resources = "0.9"

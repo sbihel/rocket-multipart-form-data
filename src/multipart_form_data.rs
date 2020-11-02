@@ -1,12 +1,8 @@
-extern crate multipart;
-extern crate rocket;
-
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::{
@@ -16,25 +12,35 @@ use crate::{
 
 use crate::mime::{self, Mime};
 
-use rocket::http::ContentType;
-use rocket::Data;
+use rocket::futures::{Stream, TryStreamExt};
+use rocket::{
+    data::DataStream,
+    http::{hyper::Bytes, ContentType},
+};
 
-use multipart::server::Multipart;
+use multipart_async::server::Multipart;
+
+fn into_bytes_stream<R>(r: R) -> impl Stream<Item = rocket::tokio::io::Result<Bytes>>
+where
+    R: rocket::tokio::io::AsyncRead, {
+    tokio_util::codec::FramedRead::new(r, tokio_util::codec::BytesCodec::new())
+        .map_ok(|bytes| bytes.freeze())
+}
 
 /// Parsed multipart/form-data.
 #[derive(Debug)]
 pub struct MultipartFormData {
-    pub files: HashMap<Arc<str>, Vec<FileField>>,
-    pub raw: HashMap<Arc<str>, Vec<RawField>>,
-    pub texts: HashMap<Arc<str>, Vec<TextField>>,
+    pub files: HashMap<String, Vec<FileField>>,
+    pub raw: HashMap<String, Vec<RawField>>,
+    pub texts: HashMap<String, Vec<TextField>>,
 }
 
 impl MultipartFormData {
     /// Parse multipart/form-data from the HTTP body.
-    pub fn parse(
+    pub async fn parse(
         content_type: &ContentType,
-        data: Data,
-        mut options: MultipartFormDataOptions,
+        data: DataStream,
+        mut options: MultipartFormDataOptions<'_>,
     ) -> Result<MultipartFormData, MultipartFormDataError> {
         if !content_type.is_form_data() {
             return Err(MultipartFormDataError::NotFormDataError);
@@ -47,15 +53,15 @@ impl MultipartFormData {
 
         options.allowed_fields.sort_by_key(|e| e.field_name);
 
-        let mut multipart = Multipart::with_body(data.open(), boundary);
+        let mut multipart = Multipart::with_body(into_bytes_stream(data), boundary);
 
-        let mut files: HashMap<Arc<str>, Vec<FileField>> = HashMap::new();
-        let mut raw: HashMap<Arc<str>, Vec<RawField>> = HashMap::new();
-        let mut texts: HashMap<Arc<str>, Vec<TextField>> = HashMap::new();
+        let mut files: HashMap<String, Vec<FileField>> = HashMap::new();
+        let mut raw: HashMap<String, Vec<RawField>> = HashMap::new();
+        let mut texts: HashMap<String, Vec<TextField>> = HashMap::new();
 
         let mut output_err: Option<MultipartFormDataError> = None;
 
-        'outer: while let Some(entry) = multipart.read_entry()? {
+        'outer: while let Some(entry) = multipart.next_field().await? {
             let field_name = entry.headers.name;
             let content_type: Option<Mime> = entry.headers.content_type;
 
@@ -122,8 +128,6 @@ impl MultipartFormData {
                 }
 
                 let drop_field = {
-                    let mut buffer = [0u8; 4096];
-
                     let field = unsafe { options.allowed_fields.get_unchecked_mut(vi) };
 
                     let mut data = entry.data;
@@ -167,8 +171,8 @@ impl MultipartFormData {
                             let mut sum_c = 0u64;
 
                             loop {
-                                let c = match data.read(&mut buffer) {
-                                    Ok(c) => c,
+                                let chunk = match data.try_next().await {
+                                    Ok(chunk) => chunk,
                                     Err(err) => {
                                         try_delete(&target_path);
 
@@ -178,11 +182,13 @@ impl MultipartFormData {
                                     }
                                 };
 
-                                if c == 0 {
+                                let chunk = if let Some(chunk) = chunk {
+                                    chunk
+                                } else {
                                     break;
-                                }
+                                };
 
-                                sum_c += c as u64;
+                                sum_c += chunk.len() as u64;
 
                                 if sum_c > field.size_limit {
                                     try_delete(&target_path);
@@ -193,7 +199,7 @@ impl MultipartFormData {
                                     break 'outer;
                                 }
 
-                                match file.write(&buffer[..c]) {
+                                match file.write(&chunk) {
                                     Ok(_) => (),
                                     Err(err) => {
                                         try_delete(&target_path);
@@ -238,8 +244,8 @@ impl MultipartFormData {
                             let mut bytes = Vec::new();
 
                             loop {
-                                let c = match data.read(&mut buffer) {
-                                    Ok(c) => c,
+                                let chunk = match data.try_next().await {
+                                    Ok(chunk) => chunk,
                                     Err(err) => {
                                         output_err = Some(err.into());
 
@@ -247,18 +253,20 @@ impl MultipartFormData {
                                     }
                                 };
 
-                                if c == 0 {
+                                let chunk = if let Some(chunk) = chunk {
+                                    chunk
+                                } else {
                                     break;
-                                }
+                                };
 
-                                if bytes.len() as u64 + c as u64 > field.size_limit {
+                                if bytes.len() as u64 + chunk.len() as u64 > field.size_limit {
                                     output_err =
                                         Some(MultipartFormDataError::DataTooLargeError(field_name));
 
                                     break 'outer;
                                 }
 
-                                bytes.extend_from_slice(&buffer[..c]);
+                                bytes.extend_from_slice(&chunk);
                             }
 
                             if might_be_empty_file_input_in_html {
@@ -290,7 +298,7 @@ impl MultipartFormData {
                             let mut text_buffer = Vec::new();
 
                             loop {
-                                let c = match data.read(&mut buffer) {
+                                let chunk = match data.try_next().await {
                                     Ok(c) => c,
                                     Err(err) => {
                                         output_err = Some(err.into());
@@ -299,18 +307,21 @@ impl MultipartFormData {
                                     }
                                 };
 
-                                if c == 0 {
+                                let chunk = if let Some(chunk) = chunk {
+                                    chunk
+                                } else {
                                     break;
-                                }
+                                };
 
-                                if text_buffer.len() as u64 + c as u64 > field.size_limit {
+                                if text_buffer.len() as u64 + chunk.len() as u64 > field.size_limit
+                                {
                                     output_err =
                                         Some(MultipartFormDataError::DataTooLargeError(field_name));
 
                                     break 'outer;
                                 }
 
-                                text_buffer.extend_from_slice(&buffer[..c]);
+                                text_buffer.extend_from_slice(&chunk);
                             }
 
                             if might_be_empty_file_input_in_html {
@@ -366,7 +377,7 @@ impl MultipartFormData {
             }
 
             loop {
-                if multipart.read_entry()?.is_none() {
+                if multipart.next_field().await?.is_none() {
                     break;
                 }
             }
